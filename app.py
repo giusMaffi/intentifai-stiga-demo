@@ -10,20 +10,38 @@ from sentence_transformers import SentenceTransformer
 # ============ Config ============
 DATA_PATH = Path("data/pdp_sample.csv")
 
+# Categoria: ROBOT (scalabile a future categorie)
 CATEGORY_CONFIG = {
     "robot": {
-        "aliases": ["robot", "robot tagliaerba", "robot lawnmower", "tosaerba robot", "robot per prato", "lawn"],
-        "attributes": ["coverage_m2", "noise_db", "slope_max_percent"],
-        "fit_weights": {"coverage_m2": 0.4, "noise_db": 0.3, "slope_max_percent": 0.3},
         "label": "Robot Lawnmowers",
+        # attributi chiave con metadati per parsing/filtri
+        "attributes": {
+            "coverage_m2": {
+                "aliases": ["m2", "mq", "m²", "copertura", "superficie", "area", "metri quadrati"],
+                "unit": "m2",
+                "prefer_direction": "min"  # spesso l'utente indica un minimo richiesto, ma supportiamo tutto
+            },
+            "noise_db": {
+                "aliases": ["db", "decibel", "rumore", "rumorosità", "noise"],
+                "unit": "db",
+                "prefer_direction": "max"
+            },
+            "slope_max_percent": {
+                "aliases": ["pendenza", "slope", "%"],
+                "unit": "%",
+                "prefer_direction": "min"
+            }
+        },
+        # pesi per ranking "fit" (multi-criterio)
+        "fit_weights": {"coverage_m2": 0.4, "noise_db": 0.3, "slope_max_percent": 0.3},
+        # campi mostrati nella riga risultato
         "result_fields": ["coverage_m2", "slope_max_percent", "noise_db"],
-    },
-    # pronto per future categorie (chainsaw, tosaerba, ecc.)
+    }
 }
 
-st.set_page_config(page_title="IntentifAI × STIGA – PDP Chat (Robot)", page_icon="🟡", layout="wide")
+st.set_page_config(page_title="Assistente prodotti – Robot STIGA (Demo)", page_icon="🟡", layout="wide")
 st.title("Assistente prodotti – Robot STIGA (Demo)")
-st.caption("Demo interna basata su dati PDP pubblici. Risposte con fonti. UI senza reasoning esposto.")
+st.caption("Demo interna basata su dati PDP pubblici. UI pulita, risultati con fonti.")
 
 # ============ Helpers ============
 
@@ -31,61 +49,154 @@ def normalize(text: str) -> str:
     return (text or "").lower().strip()
 
 def auto_detect_category(q: str) -> str:
+    # per ora abbiamo solo robot
+    return "robot"
+
+# -------- parsing generico di range e operatori --------
+OPS = {
+    "<": "max", "<=": "max", "≤": "max",
+    ">": "min", ">=": "min", "≥": "min"
+}
+WORDS_MAX = ["sotto", "max", "massimo", "non oltre", "fino a"]
+WORDS_MIN = ["sopra", "almeno", "minimo", "da", "più di", "maggiore di"]
+WORDS_ABOUT = ["circa", "intorno a", "~", "approx", "approssimativamente"]
+WORDS_BETWEEN = ["tra", "fra"]  # es. "tra 55 e 60 dB"
+
+def _to_float(s: str) -> float:
+    try:
+        return float(s.replace(",", "."))
+    except:
+        return float("nan")
+
+def parse_constraints_flexible(q: str, cfg: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """
+    Ritorna un dict del tipo:
+    {
+      "coverage_m2": {"min": 600},            # o {"max": 700}, o {"min": 600, "max": 900}
+      "noise_db": {"max": 60},
+      "slope_max_percent": {"min": 35}
+    }
+    Capisce: <, <=, >, >=, "sotto", "sopra", "almeno", "massimo", "tra X e Y", "circa N".
+    """
     t = normalize(q)
-    for cat, cfg in CATEGORY_CONFIG.items():
-        if any(a in t for a in cfg["aliases"]):
-            return cat
-    return "robot"  # default
+    cons: Dict[str, Dict[str, float]] = {}
 
-def parse_constraints(q: str) -> Dict[str, Any]:
-    """ Estrae vincoli generici (coverage m², noise dB, slope %) interpretati per ROBOT. """
-    t = normalize(q).replace(",", ".")
-    c: Dict[str, Any] = {}
+    # pre-build alias→attr map
+    alias_map = {}
+    for attr, meta in cfg["attributes"].items():
+        for a in meta["aliases"]:
+            alias_map[a] = attr
 
-    # coverage (m²)
-    cov = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*(m2|mq|m²)", t)
-    if cov:
-        op, num = cov.group(1), float(cov.group(2))
-        if op in (">", ">=") or re.search(r"\b(almeno|minimo|min)\b", t):
-            c["coverage_m2_min"] = num
-        elif op in ("<", "<=") or re.search(r"\b(sotto|max|massimo)\b", t):
-            c["coverage_m2_max"] = num
-        else:
-            c["coverage_m2_min"] = num
+    # 1) pattern con operatore esplicito: es. "<= 60 dB", ">= 600 m2"
+    #    catturiamo (op)(numero)(unit o alias)
+    #    unit può essere db, %, m2/mq/m²; oppure usiamo alias parola (pendenza, rumorosità...)
+    pattern_op = r"(<=|>=|<|>|≤|≥)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
+    for m in re.finditer(pattern_op, t):
+        op_raw = m.group(1)
+        num = _to_float(m.group(2))
+        unit_or_alias = (m.group(3) or "").lower()
+        # mappa unit/alias -> attr
+        attr = None
+        if unit_or_alias in ["m2", "mq", "m²"]:
+            attr = "coverage_m2"
+        elif unit_or_alias in ["db", "decibel"]:
+            attr = "noise_db"
+        elif unit_or_alias in ["%"]:
+            attr = "slope_max_percent"
+        elif unit_or_alias in alias_map:
+            attr = alias_map[unit_or_alias]
+        # se attr non individuato qui, proviamo a dedurre dall'intorno testi (grezzo ma utile)
+        if not attr:
+            window = t[max(0, m.start()-20):m.end()+20]
+            for al, a_attr in alias_map.items():
+                if al in window:
+                    attr = a_attr
+                    break
+        if not attr:
+            continue
+        # scrivi min/max
+        cons.setdefault(attr, {})
+        direction = OPS.get(op_raw, None)
+        if direction == "max":
+            cons[attr]["max"] = num
+        elif direction == "min":
+            cons[attr]["min"] = num
 
-    # noise (dB)
-    noisep = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*d\s*b", t)
-    if noisep or re.search(r"(sotto|max|massimo|minimo|almeno)\s*\d+(?:\.\d+)?\s*d\s*b", t):
-        if noisep:
-            op, num = noisep.group(1), float(noisep.group(2))
-        else:
-            m = re.search(r"(sotto|max|massimo|minimo|almeno)\s*(\d+(?:\.\d+)?)\s*d\s*b", t)
-            word, num = m.group(1), float(m.group(2))
-            op = "<=" if word in ("sotto", "max", "massimo") else ">="
-        if op in ("<", "<="):
-            c["noise_db_max"] = num
-        elif op in (">", ">="):
-            c["noise_db_min"] = num
-        else:
-            c["noise_db_max"] = num
+    # 2) frasi "sotto/sopra/almeno/massimo <numero> <unit/alias>"
+    pattern_word = r"(sotto|max|massimo|almeno|minimo|sopra|più di|maggiore di)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
+    for m in re.finditer(pattern_word, t):
+        word = m.group(1)
+        num = _to_float(m.group(2))
+        unit_or_alias = (m.group(3) or "").lower()
+        attr = None
+        if unit_or_alias in ["m2", "mq", "m²"]:
+            attr = "coverage_m2"
+        elif unit_or_alias in ["db", "decibel"]:
+            attr = "noise_db"
+        elif unit_or_alias in ["%"]:
+            attr = "slope_max_percent"
+        elif unit_or_alias in alias_map:
+            attr = alias_map[unit_or_alias]
+        if not attr:
+            # prova a dedurre dall'intorno
+            span = m.span()
+            window = t[max(0, span[0]-20):span[1]+20]
+            for al, a_attr in alias_map.items():
+                if al in window:
+                    attr = a_attr
+                    break
+        if not attr:
+            continue
+        cons.setdefault(attr, {})
+        if word in WORDS_MAX:
+            cons[attr]["max"] = num
+        elif word in WORDS_MIN or word in ["più di", "maggiore di"]:
+            cons[attr]["min"] = num
 
-    # slope (%)
-    slope = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*%(\s*(pendenza|slope))?", t)
-    if slope or re.search(r"(pendenza|slope)\s*(\d+(?:\.\d+)?)\s*%", t):
-        if slope:
-            op, num = slope.group(1), float(slope.group(2))
-        else:
-            m = re.search(r"(pendenza|slope)\s*(\d+(?:\.\d+)?)\s*%", t)
-            op, num = None, float(m.group(2))
-        # per robot: pendenza richiesta è capacità minima
-        if (op in (">", ">=")) or re.search(r"\b(almeno|minimo|min)\b", t):
-            c["slope_max_percent_min"] = num
-        elif op in ("<", "<=") or re.search(r"\b(sotto|max|massimo)\b", t):
-            c["slope_max_percent_max"] = num
-        else:
-            c["slope_max_percent_min"] = num
+    # 3) range: "tra X e Y <unit/alias>"
+    #    esempi: "tra 55 e 60 dB", "fra 500 e 800 m2"
+    pattern_between = r"(tra|fra)\s*(\d+(?:[.,]\d+)?)\s*e\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
+    for m in re.finditer(pattern_between, t):
+        a = _to_float(m.group(2))
+        b = _to_float(m.group(3))
+        unit_or_alias = (m.group(4) or "").lower()
+        lo, hi = min(a, b), max(a, b)
+        attr = None
+        if unit_or_alias in ["m2", "mq", "m²"]:
+            attr = "coverage_m2"
+        elif unit_or_alias in ["db", "decibel"]:
+            attr = "noise_db"
+        elif unit_or_alias in ["%"]:
+            attr = "slope_max_percent"
+        elif unit_or_alias in alias_map:
+            attr = alias_map[unit_or_alias]
+        if attr:
+            cons.setdefault(attr, {})
+            cons[attr]["min"] = lo
+            cons[attr]["max"] = hi
 
-    return c
+    # 4) "circa N <unit>" -> min/max con piccola tolleranza (±5% o soglia fissa)
+    pattern_about = r"(circa|intorno a|~|approx|approssimativamente)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
+    for m in re.finditer(pattern_about, t):
+        num = _to_float(m.group(2))
+        unit_or_alias = (m.group(3) or "").lower()
+        attr = None
+        if unit_or_alias in ["m2", "mq", "m²"]:
+            attr = "coverage_m2"
+        elif unit_or_alias in ["db", "decibel"]:
+            attr = "noise_db"
+        elif unit_or_alias in ["%"]:
+            attr = "slope_max_percent"
+        elif unit_or_alias in alias_map:
+            attr = alias_map[unit_or_alias]
+        if not attr:
+            continue
+        cons.setdefault(attr, {})
+        tol = 0.05 * num  # ±5%
+        cons[attr]["min"] = min(cons[attr].get("min", num - tol), num - tol)
+        cons[attr]["max"] = max(cons[attr].get("max", num + tol), num + tol)
+
+    return cons
 
 def build_passage(row: pd.Series) -> str:
     parts = [
@@ -130,71 +241,62 @@ def load_data_and_embeddings() -> Tuple[pd.DataFrame, List[str], List[Dict[str,A
         })
 
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    emb_matrix = model.encode(passages, normalize_embeddings=True)  # (N,D), normalizzati
+    emb_matrix = model.encode(passages, normalize_embeddings=True)  # (N,D)
     return df, passages, meta, model, emb_matrix
 
 def cosine_scores_to_all(q: str, model, emb_matrix: np.ndarray) -> np.ndarray:
     q_emb = model.encode([q], normalize_embeddings=True)  # (1,D)
-    return (emb_matrix @ q_emb.T).ravel()  # cos perché embeddings normalizzati
+    return (emb_matrix @ q_emb.T).ravel()  # cos perché normalizzati
 
 # ---------- Filtri + ranking ----------
 def category_mask(meta: List[Dict[str,Any]], cat_key: str) -> List[int]:
-    """Ritorna indici dei prodotti che appartengono alla categoria selezionata."""
     return [i for i, m in enumerate(meta) if normalize(m.get("category","")) == normalize(cat_key)]
 
-def hard_filter_indices_robot(meta: List[Dict[str,Any]], cons: Dict[str,Any], idx_pool: List[int]) -> List[int]:
+def within_range(val: float, rng: Dict[str,float]) -> bool:
+    if pd.isna(val): 
+        return False
+    ok = True
+    if "min" in rng:
+        ok &= float(val) >= rng["min"]
+    if "max" in rng:
+        ok &= float(val) <= rng["max"]
+    return ok
+
+def hard_filter_indices_cat(meta: List[Dict[str,Any]], cat_cfg: Dict[str,Any], cons: Dict[str,Dict[str,float]], idx_pool: List[int]) -> List[int]:
     out = []
     for i in idx_pool:
         m = meta[i]
         ok = True
-        # coverage
-        if "coverage_m2_min" in cons and pd.notna(m.get("coverage_m2")):
-            ok &= float(m["coverage_m2"]) >= cons["coverage_m2_min"]
-        if "coverage_m2_max" in cons and pd.notna(m.get("coverage_m2")):
-            ok &= float(m["coverage_m2"]) <= cons["coverage_m2_max"]
-        # noise
-        if "noise_db_max" in cons and pd.notna(m.get("noise_db")):
-            ok &= float(m["noise_db"]) <= cons["noise_db_max"]
-        if "noise_db_min" in cons and pd.notna(m.get("noise_db")):
-            ok &= float(m["noise_db"]) >= cons["noise_db_min"]
-        # slope
-        if "slope_max_percent_min" in cons and pd.notna(m.get("slope_max_percent")):
-            ok &= float(m["slope_max_percent"]) >= cons["slope_max_percent_min"]
-        if "slope_max_percent_max" in cons and pd.notna(m.get("slope_max_percent")):
-            ok &= float(m["slope_max_percent"]) <= cons["slope_max_percent_max"]
+        for attr in cat_cfg["attributes"].keys():
+            if attr in cons:
+                rng = cons[attr]
+                ok &= within_range(m.get(attr if attr != "slope_max_percent" else "slope_max_percent"), rng)
         if ok:
             out.append(i)
     return out
 
-def score_fit_robot(m: Dict[str,Any], cons: Dict[str,Any], weights: Dict[str,float]) -> float:
+def score_fit_cat(m: Dict[str,Any], cons: Dict[str,Dict[str,float]], weights: Dict[str,float]) -> float:
     fit = 0.0
-    # coverage (preferisci >= richiesto e vicino al target)
-    if "coverage_m2_min" in cons and pd.notna(m.get("coverage_m2")):
-        w = cons["coverage_m2_min"]; c = float(m["coverage_m2"])
-        if c >= w:
-            fit += weights.get("coverage_m2", 0.0) * (1.0 - min((c - w)/max(w,1), 0.5))
-    if "coverage_m2_max" in cons and pd.notna(m.get("coverage_m2")):
-        w = cons["coverage_m2_max"]; c = float(m["coverage_m2"])
-        if c <= w:
-            fit += weights.get("coverage_m2", 0.0) * (1.0 - min((w - c)/max(w,1), 0.5))
-    # noise (preferisci <= soglia)
-    if "noise_db_max" in cons and pd.notna(m.get("noise_db")):
-        w = cons["noise_db_max"]; n = float(m["noise_db"])
-        if n <= w:
-            fit += weights.get("noise_db", 0.0) * (1.0 - min((w - n)/max(w,1), 0.5))
-    if "noise_db_min" in cons and pd.notna(m.get("noise_db")):
-        w = cons["noise_db_min"]; n = float(m["noise_db"])
-        if n >= w:
-            fit += weights.get("noise_db", 0.0) * (1.0 - min((n - w)/max(w,1), 0.5))
-    # slope (preferisci >= richiesta)
-    if "slope_max_percent_min" in cons and pd.notna(m.get("slope_max_percent")):
-        wv = cons["slope_max_percent_min"]; s = float(m["slope_max_percent"])
-        if s >= wv:
-            fit += weights.get("slope_max_percent", 0.0) * (1.0 - min((s - wv)/max(wv,1), 0.5))
-    if "slope_max_percent_max" in cons and pd.notna(m.get("slope_max_percent")):
-        wv = cons["slope_max_percent_max"]; s = float(m["slope_max_percent"])
-        if s <= wv:
-            fit += weights.get("slope_max_percent", 0.0) * (1.0 - min((wv - s)/max(wv,1), 0.5))
+    for attr, rng in cons.items():
+        val = m.get(attr)
+        if pd.isna(val): 
+            continue
+        w = weights.get(attr, 0.0)
+        # distanza dal bordo "migliore": se "max", preferisci più basso; se "min", preferisci più alto;
+        # se range, preferisci stare vicino al centro del range
+        if "min" in rng and "max" in rng:
+            center = (rng["min"] + rng["max"]) / 2.0
+            span = max(rng["max"] - rng["min"], 1e-6)
+            diff = abs(float(val) - center) / span  # 0 = centro perfetto
+            fit += w * (1.0 - min(diff, 1.0))  # più vicino al centro, meglio
+        elif "max" in rng and "min" not in rng:
+            # più basso è, meglio è; normalizza rispetto alla soglia
+            if float(val) <= rng["max"]:
+                fit += w * (1.0 - min((rng["max"] - float(val)) / max(rng["max"], 1), 0.5))
+        elif "min" in rng and "max" not in rng:
+            # più alto è, meglio è; normalizza rispetto alla soglia
+            if float(val) >= rng["min"]:
+                fit += w * (1.0 - min((float(val) - rng["min"]) / max(rng["min"], 1), 0.5))
     return fit
 
 def render_results(title: str, order_idx: List[int], meta: List[Dict[str,Any]], cfg: Dict[str,Any], limit: int = 50):
@@ -208,15 +310,11 @@ def render_results(title: str, order_idx: List[int], meta: List[Dict[str,Any]], 
     for i in order_idx:
         m = meta[i]
         cites.add(m["pdp_url"])
-        st.markdown(
-            f"- **{m['title']}** — "
-            + " · ".join([
-                f"copertura **{m.get('coverage_m2','?')} m²**" if "coverage_m2" in key_fields else "",
-                f"pendenza max **{m.get('slope_max_percent','?')}%**" if "slope_max_percent" in key_fields else "",
-                f"rumorosità **{m.get('noise_db','?')} dB**" if "noise_db" in key_fields else "",
-            ]).replace("  ·  · ", " · ").strip(" · ")
-            + f" — [PDP]({m['pdp_url']})"
-        )
+        bits = []
+        if "coverage_m2" in key_fields: bits.append(f"copertura **{m.get('coverage_m2','?')} m²**")
+        if "slope_max_percent" in key_fields: bits.append(f"pendenza max **{m.get('slope_max_percent','?')}%**")
+        if "noise_db" in key_fields: bits.append(f"rumorosità **{m.get('noise_db','?')} dB**")
+        st.markdown(f"- **{m['title']}** — " + " · ".join(bits) + f" — [PDP]({m['pdp_url']})")
         shown += 1
         if shown >= limit:
             break
@@ -225,17 +323,16 @@ def render_results(title: str, order_idx: List[int], meta: List[Dict[str,Any]], 
 # ============ App ============
 
 with st.sidebar:
-    st.subheader("Filtri (mettili nella domanda)")
-    st.write("Esempi: `600 m²`, `pendenza ≥ 35%`, `sotto 60 dB`")
-    cat_choice = st.selectbox("Categoria", options=["Auto (dalla domanda)", "Robot"], index=1)
+    st.subheader("Suggerimenti")
+    st.write("Esempi: `≥ 800 m²`, `sotto 60 dB`, `pendenza ≥ 35%`, `tra 55 e 60 dB`")
+    cat_choice = st.selectbox("Categoria", options=["Robot"], index=0)
 
 df, passages, meta, model, emb_matrix = load_data_and_embeddings()
 
 query = st.text_input("Fai una domanda sui robot STIGA (IT/EN):", "")
 
 if query:
-    # Categoria
-    target_cat = "robot" if cat_choice == "Robot" else auto_detect_category(query)
+    target_cat = "robot"
     cfg = CATEGORY_CONFIG[target_cat]
 
     # similarità verso tutto il dataset
@@ -244,30 +341,28 @@ if query:
     # pool della categoria
     pool_idx = category_mask(meta, target_cat)
 
-    # vincoli dalla query
-    cons = parse_constraints(query)
+    # vincoli (flessibili): <, >, tra, circa...
+    cons = parse_constraints_flexible(query, cfg)
 
-    # hard filter AND su TUTTI i vincoli per la categoria Robot
-    idx_valid = hard_filter_indices_robot(meta, cons, pool_idx)
+    # hard filter combinato (AND) su TUTTI i vincoli passati
+    idx_valid = hard_filter_indices_cat(meta, cfg, cons, pool_idx)
 
-    # se ci sono match esatti → ordino
     if idx_valid:
         scored = []
         for i in idx_valid:
-            fit = score_fit_robot(meta[i], cons, cfg["fit_weights"])
+            fit = score_fit_cat(meta[i], cons, cfg["fit_weights"])
             tot = 0.75*float(cos[i]) + 0.25*fit
             scored.append((tot, i))
         order_idx = [i for _, i in sorted(scored, key=lambda x: x[0], reverse=True)]
         render_results("Opzioni adatte alle tue esigenze", order_idx, meta, cfg)
     else:
-        # fallback: nessun match preciso → mostro i più pertinenti della categoria
+        # fallback: niente match perfetto → alternative per pertinenza nella categoria
         alt = [(float(cos[i]), i) for i in pool_idx]
         order_idx = [i for _, i in sorted(alt, key=lambda x: x[0], reverse=True)]
         render_results("Nessun match perfetto — alternative più vicine", order_idx, meta, cfg)
 
-    # Debug SOLO per staff (non per clienti)
+    # Debug interno per noi
     with st.expander("🔧 Debug (staff)"):
-        st.write("Categoria:", target_cat)
         st.write("Vincoli estratti:", cons)
         st.write("Prodotti categoria:", len(pool_idx))
         st.write("Match precisi:", len(idx_valid))
