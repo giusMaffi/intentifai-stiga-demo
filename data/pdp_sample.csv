@@ -1,0 +1,7 @@
+sku,title,pdp_url,category,coverage_m2,cutting_height_min_mm,cutting_height_max_mm,noise_db,slope_max_percent,compatibility,features,price_eur
+A500,STIGA A500 Robot Lawnmower,https://www.stiga.com/it/a500,Robot,500,25,60,59,35,"ePower 20V 4Ah|ePower 20V 5Ah","GPS; Rain sensor; App control",999
+A750,STIGA A750 Robot Lawnmower,https://www.stiga.com/it/a750,Robot,750,25,60,59,45,"ePower 20V 4Ah|ePower 20V 5Ah","GPS; Rain sensor; App control",1299
+A1000,STIGA A1000 Robot Lawnmower,https://www.stiga.com/it/a1000,Robot,1000,20,60,58,45,"ePower 20V 4Ah|ePower 20V 5Ah","GPS; App control",1499
+A1500,STIGA A1500 Robot Lawnmower,https://www.stiga.com/it/a1500,Robot,1500,20,60,60,45,"ePower 20V 5Ah|ePower 20V 7.5Ah","GPS; Multi-zone; App control",1799
+A2000,STIGA A2000 Robot Lawnmower,https://www.stiga.com/it/a2000,Robot,2000,20,60,60,45,"ePower 20V 7.5Ah","GPS; Multi-zone; App control; Rain sensor",1999
+A3000,STIGA A3000 Robot Lawnmower,https://www.stiga.com/it/a3000,Robot,3000,20,60,61,45,"ePower 48V 5Ah","GPS; RTK assist; Multi-zone",2699
