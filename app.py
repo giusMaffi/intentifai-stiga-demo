@@ -70,131 +70,108 @@ def _to_float(s: str) -> float:
 
 def parse_constraints_flexible(q: str, cfg: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
     """
-    Ritorna un dict del tipo:
-    {
-      "coverage_m2": {"min": 600},            # o {"max": 700}, o {"min": 600, "max": 900}
-      "noise_db": {"max": 60},
-      "slope_max_percent": {"min": 35}
-    }
-    Capisce: <, <=, >, >=, "sotto", "sopra", "almeno", "massimo", "tra X e Y", "circa N".
+    Estrae vincoli flessibili per ROBOT:
+    supporta <, <=, >, >=, 'sotto/max/massimo', 'almeno/minimo/sopra',
+    'tra X e Y', e casi come 'copertura di 1000m'.
+    Ritorna es: {'coverage_m2': {'max':1000}, 'noise_db': {'max':60}, 'slope_max_percent': {'min':35}}
     """
     t = normalize(q)
     cons: Dict[str, Dict[str, float]] = {}
 
-    # pre-build alias→attr map
+    # -------- alias & unità --------
+    attr_aliases = {
+        "coverage_m2": ["m2","mq","m²","m","mt","metri","metro","metriq","copertura","superficie","area","prato"],
+        "noise_db": ["db","decibel","rumore","rumorosità","noise"],
+        "slope_max_percent": ["%","percento","pendenza","slope"]
+    }
+    # mappa rapida unit/alias -> attr
     alias_map = {}
-    for attr, meta in cfg["attributes"].items():
-        for a in meta["aliases"]:
-            alias_map[a] = attr
+    for attr, aliases in attr_aliases.items():
+        for a in aliases: alias_map[a] = attr
 
-    # 1) pattern con operatore esplicito: es. "<= 60 dB", ">= 600 m2"
-    #    catturiamo (op)(numero)(unit o alias)
-    #    unit può essere db, %, m2/mq/m²; oppure usiamo alias parola (pendenza, rumorosità...)
-    pattern_op = r"(<=|>=|<|>|≤|≥)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
-    for m in re.finditer(pattern_op, t):
-        op_raw = m.group(1)
+    def _to_float(s: str) -> float:
+        try:
+            return float(s.replace(",", "."))
+        except:
+            return float("nan")
+
+    # helper: prova a capire a quale attributo riferire il numero, guardando unità o il "contesto" vicino
+    def unit_to_attr(unit_or_alias: str, window: str) -> str:
+        u = (unit_or_alias or "").lower()
+        if u in alias_map:
+            # special case: 'm' può essere metri lineari; se nel contesto vedo 'copertura/superficie/area/prato' lo tratto come m²
+            if u in ["m","mt","metri","metro","metriq"] and not any(w in window for w in ["copertura","superficie","area","prato","mq","m²","m2"]):
+                # senza contesto chiaro, NON assumo coverage a tutti i costi -> ritorno None
+                return None
+            return alias_map[u]
+        # nessuna unit: deduco dal contesto (finestra di 24 caratteri intorno al match)
+        for kw in ["copertura","superficie","area","prato","mq","m²","m2"]:
+            if kw in window: return "coverage_m2"
+        for kw in ["db","decibel","rumore","rumorosità","noise"]:
+            if kw in window: return "noise_db"
+        for kw in ["pendenza","slope","percento","%"]:
+            if kw in window: return "slope_max_percent"
+        return None
+
+    # -------- 1) operatori espliciti: <=, >=, <, > --------
+    # es: "<= 60 db", ">=800 m2", "> 35 %"
+    for m in re.finditer(r"(<=|>=|<|>|≤|≥)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]*)", t):
+        op = m.group(1)
         num = _to_float(m.group(2))
-        unit_or_alias = (m.group(3) or "").lower()
-        # mappa unit/alias -> attr
-        attr = None
-        if unit_or_alias in ["m2", "mq", "m²"]:
-            attr = "coverage_m2"
-        elif unit_or_alias in ["db", "decibel"]:
-            attr = "noise_db"
-        elif unit_or_alias in ["%"]:
-            attr = "slope_max_percent"
-        elif unit_or_alias in alias_map:
-            attr = alias_map[unit_or_alias]
-        # se attr non individuato qui, proviamo a dedurre dall'intorno testi (grezzo ma utile)
-        if not attr:
-            window = t[max(0, m.start()-20):m.end()+20]
-            for al, a_attr in alias_map.items():
-                if al in window:
-                    attr = a_attr
-                    break
-        if not attr:
+        unit = m.group(3) or ""
+        window = t[max(0, m.start()-24): m.end()+24]
+        attr = unit_to_attr(unit, window)
+        if not attr or np.isnan(num): 
             continue
-        # scrivi min/max
         cons.setdefault(attr, {})
-        direction = OPS.get(op_raw, None)
-        if direction == "max":
+        if op in ("<","<=","≤"):
             cons[attr]["max"] = num
-        elif direction == "min":
+        elif op in (">",">=","≥"):
             cons[attr]["min"] = num
 
-    # 2) frasi "sotto/sopra/almeno/massimo <numero> <unit/alias>"
-    pattern_word = r"(sotto|max|massimo|almeno|minimo|sopra|più di|maggiore di)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
-    for m in re.finditer(pattern_word, t):
+    # -------- 2) parole-operatore: "sotto/max/massimo ... numero ..." --------
+    # permettiamo articoli/preposizioni tra parola e numero: fino a ~10 char non numerici
+    for m in re.finditer(r"(sotto|max|massimo|almeno|minimo|sopra|pi[uù]\s*di|maggiore\s*di)\s*[^0-9]{0,10}(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]*)", t):
         word = m.group(1)
         num = _to_float(m.group(2))
-        unit_or_alias = (m.group(3) or "").lower()
-        attr = None
-        if unit_or_alias in ["m2", "mq", "m²"]:
-            attr = "coverage_m2"
-        elif unit_or_alias in ["db", "decibel"]:
-            attr = "noise_db"
-        elif unit_or_alias in ["%"]:
-            attr = "slope_max_percent"
-        elif unit_or_alias in alias_map:
-            attr = alias_map[unit_or_alias]
-        if not attr:
-            # prova a dedurre dall'intorno
-            span = m.span()
-            window = t[max(0, span[0]-20):span[1]+20]
-            for al, a_attr in alias_map.items():
-                if al in window:
-                    attr = a_attr
-                    break
-        if not attr:
+        unit = m.group(3) or ""
+        window = t[max(0, m.start()-24): m.end()+24]
+        attr = unit_to_attr(unit, window)
+        if not attr or np.isnan(num): 
             continue
         cons.setdefault(attr, {})
-        if word in WORDS_MAX:
+        if word in ["sotto","max","massimo"]:
             cons[attr]["max"] = num
-        elif word in WORDS_MIN or word in ["più di", "maggiore di"]:
+        elif word in ["almeno","minimo","sopra","più di","piu di","maggiore di"]:
             cons[attr]["min"] = num
 
-    # 3) range: "tra X e Y <unit/alias>"
-    #    esempi: "tra 55 e 60 dB", "fra 500 e 800 m2"
-    pattern_between = r"(tra|fra)\s*(\d+(?:[.,]\d+)?)\s*e\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
-    for m in re.finditer(pattern_between, t):
-        a = _to_float(m.group(2))
-        b = _to_float(m.group(3))
-        unit_or_alias = (m.group(4) or "").lower()
-        lo, hi = min(a, b), max(a, b)
-        attr = None
-        if unit_or_alias in ["m2", "mq", "m²"]:
-            attr = "coverage_m2"
-        elif unit_or_alias in ["db", "decibel"]:
-            attr = "noise_db"
-        elif unit_or_alias in ["%"]:
-            attr = "slope_max_percent"
-        elif unit_or_alias in alias_map:
-            attr = alias_map[unit_or_alias]
-        if attr:
-            cons.setdefault(attr, {})
-            cons[attr]["min"] = lo
-            cons[attr]["max"] = hi
-
-    # 4) "circa N <unit>" -> min/max con piccola tolleranza (±5% o soglia fissa)
-    pattern_about = r"(circa|intorno a|~|approx|approssimativamente)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]+)?"
-    for m in re.finditer(pattern_about, t):
-        num = _to_float(m.group(2))
-        unit_or_alias = (m.group(3) or "").lower()
-        attr = None
-        if unit_or_alias in ["m2", "mq", "m²"]:
-            attr = "coverage_m2"
-        elif unit_or_alias in ["db", "decibel"]:
-            attr = "noise_db"
-        elif unit_or_alias in ["%"]:
-            attr = "slope_max_percent"
-        elif unit_or_alias in alias_map:
-            attr = alias_map[unit_or_alias]
-        if not attr:
+    # -------- 3) range: "tra 55 e 60 db" / "fra 500 e 800 m2" --------
+    for m in re.finditer(r"(tra|fra)\s*(\d+(?:[.,]\d+)?)\s*(?:e|ed)\s*(\d+(?:[.,]\d+)?)\s*([a-zA-Z%²]*)", t):
+        a = _to_float(m.group(2)); b = _to_float(m.group(3))
+        lo, hi = min(a,b), max(a,b)
+        unit = m.group(4) or ""
+        window = t[max(0, m.start()-24): m.end()+24]
+        attr = unit_to_attr(unit, window)
+        if not attr or np.isnan(lo) or np.isnan(hi): 
             continue
         cons.setdefault(attr, {})
-        tol = 0.05 * num  # ±5%
-        cons[attr]["min"] = min(cons[attr].get("min", num - tol), num - tol)
-        cons[attr]["max"] = max(cons[attr].get("max", num + tol), num + tol)
+        cons[attr]["min"] = lo
+        cons[attr]["max"] = hi
+
+    # -------- 4) pattern specifici di copertura: "copertura di 1000m / 1000 mq / 1000" --------
+    # Se troviamo 'copertura/superficie/area/prato ... numero [m/mq/m²]' assumiamo coverage_m2
+    for m in re.finditer(r"(copertura|superficie|area|prato)[^0-9]{0,10}(\d+(?:[.,]\d+)?)(\s*(m2|mq|m²|m|mt|metri)?)", t):
+        num = _to_float(m.group(2))
+        unit = (m.group(4) or "").lower()
+        if np.isnan(num): 
+            continue
+        cons.setdefault("coverage_m2", {})
+        # Se c'è "sotto/max/massimo" nelle vicinanze, trattalo come max; altrimenti come min (richiesta minima)
+        window = t[max(0, m.start()-16): m.end()+16]
+        if any(w in window for w in ["sotto","max","massimo"]):
+            cons["coverage_m2"]["max"] = num
+        else:
+            cons["coverage_m2"]["min"] = num
 
     return cons
 
