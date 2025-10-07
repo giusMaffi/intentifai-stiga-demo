@@ -27,10 +27,9 @@ def parse_constraints(q: str) -> Dict[str, Any]:
     Ritorna dict con chiavi *_min / *_max.
     """
     t = normalize(q).replace(",", ".")
-    c = {}
+    c: Dict[str, Any] = {}
 
     # coverage m2
-    # pattern numero + m2/mq/m² con eventuale operatore
     cov_op_num = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*(m2|mq|m²)", t)
     if cov_op_num:
         op, num = cov_op_num.group(1), float(cov_op_num.group(2))
@@ -39,7 +38,6 @@ def parse_constraints(q: str) -> Dict[str, Any]:
         elif op in ("<", "<=") or re.search(r"\b(sotto|massimo|max)\b", t):
             c["coverage_m2_max"] = num
         else:
-            # se nessun operatore, trattiamo come target minimo (copertura richiesta)
             c["coverage_m2_min"] = num
 
     # noise dB
@@ -51,7 +49,6 @@ def parse_constraints(q: str) -> Dict[str, Any]:
             m = re.search(r"(sotto|max|massimo|minimo|almeno)\s*(\d+(?:\.\d+)?)\s*d\s*b", t)
             word, num = m.group(1), float(m.group(2))
             op = "<=" if word in ("sotto", "max", "massimo") else ">="
-
         if op in ("<", "<="):
             c["noise_db_max"] = num
         elif op in (">", ">="):
@@ -67,7 +64,7 @@ def parse_constraints(q: str) -> Dict[str, Any]:
         else:
             m = re.search(r"(pendenza|slope)\s*(\d+(?:\.\d+)?)\s*%", t)
             op, num = None, float(m.group(2))
-        # interpretazione: l’utente indica una pendenza che il modello deve poter gestire (min capability)
+        # interpretazione: capacità minima richiesta
         if (op in (">", ">=")) or re.search(r"\b(almeno|minimo|min)\b", t):
             c["slope_max_percent_min"] = num
         elif op in ("<", "<=") or re.search(r"\b(sotto|max|massimo)\b", t):
@@ -99,8 +96,12 @@ def load_data_and_index() -> Tuple[pd.DataFrame, List[str], List[Dict[str,Any]],
         st.error("Manca data/pdp_sample.csv. Caricalo nel repo.")
         st.stop()
     df = pd.read_csv(DATA_PATH)
-    # Passaggi & meta
-    passages, meta = [], []
+    if df.empty:
+        st.error("Il CSV è vuoto. Aggiungi almeno una riga di prodotto.")
+        st.stop()
+
+    passages: List[str] = []
+    meta: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         passages.append(build_passage(r))
         meta.append({
@@ -117,13 +118,18 @@ def load_data_and_index() -> Tuple[pd.DataFrame, List[str], List[Dict[str,Any]],
         })
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     emb = model.encode(passages, normalize_embeddings=True)
-    nn = NearestNeighbors(n_neighbors=12, metric="cosine")
+    nn = NearestNeighbors(n_neighbors=min(12, len(passages)), metric="cosine")
     nn.fit(emb)
+    # persist in session for safety
+    st.session_state["__emb_count"] = len(passages)
     return df, passages, meta, model, nn
 
 def retrieve(query: str, model, nn, passages, meta, top_k=10):
+    if len(passages) == 0:
+        return []
+    k = min(top_k, len(passages))
     q_emb = model.encode([query], normalize_embeddings=True)
-    dist, idx = nn.kneighbors(q_emb, n_neighbors=top_k)
+    dist, idx = nn.kneighbors(q_emb, n_neighbors=k)
     hits = []
     for d, i in zip(dist[0], idx[0]):
         hits.append({"score": float(1 - d), "passage": passages[i], "meta": meta[i]})
@@ -154,13 +160,11 @@ def hard_filter(hits: List[Dict[str,Any]], cons: Dict[str,Any]) -> List[Dict[str
             if float(m["slope_max_percent"]) > cons["slope_max_percent_max"]:
                 return False
         return True
-
     return [h for h in hits if ok(h["meta"])]
 
 def score_fit(h: Dict[str,Any], cons: Dict[str,Any]) -> float:
     fit = 0.0
     m = h["meta"]
-    # preferenza soft per avvicinamento ai vincoli
     if "coverage_m2_min" in cons and pd.notna(m.get("coverage_m2")):
         w = cons["coverage_m2_min"]; c = float(m["coverage_m2"])
         if c >= w: fit += 1.0 - min((c - w)/max(w,1), 0.5)
@@ -183,7 +187,6 @@ def compose_answer(query: str, hits: List[Dict[str,Any]], cons: Dict[str,Any], f
         msg += "\nVuoi che ti mostri le **migliori alternative più vicine** ai requisiti?"
         return msg
 
-    # rerank (score semantico + fit)
     for h in hits:
         h["fit"] = score_fit(h, cons)
         h["tot"] = 0.7*h["score"] + 0.3*h["fit"]
@@ -221,16 +224,15 @@ df, passages, meta, model, nn = load_data_and_index()
 query = st.text_input("Fai una domanda sulle PDP STIGA (IT/EN):", "")
 if query:
     cons = parse_constraints(query)
-    hits = retrieve(query, model, nn, passages, meta)
+    hits_all = retrieve(query, model, nn, passages, meta, top_k=10)
 
-    # hard filter prima del rerank
-    filtered = hard_filter(hits, cons)
+    filtered = hard_filter(hits_all, cons)
     filtered_out = False
-    if filtered:
-        filtered_out = True
-        used = filtered
+    used = filtered
+    if not used:
+        used = hits_all  # fallback soft
     else:
-        used = hits  # fallback se nessuno matcha i vincoli
+        filtered_out = True
 
     answer = compose_answer(query, used, cons, filtered_out)
     st.markdown(answer)
