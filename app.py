@@ -1,6 +1,5 @@
 import re
 import json
-import time
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -13,9 +12,72 @@ DATA_PATH = Path("data/pdp_sample.csv")
 
 st.set_page_config(page_title="IntentifAI × STIGA – PDP Chat (MVP)", page_icon="🟡", layout="wide")
 st.title("IntentifAI × STIGA – PDP Chat (MVP)")
-st.caption("Demo interna: risposte basate su contenuti PDP indicizzati (con citazioni URL).")
+st.caption("Demo interna: risposte basate su contenuti PDP indicizzati (con citazioni URL) con vincoli hard-filter.")
 
-# ---------- Utilities ----------
+# -------------------- Parsing vincoli --------------------
+def normalize(text: str) -> str:
+    return text.lower().strip()
+
+def parse_constraints(q: str) -> Dict[str, Any]:
+    """
+    Estrae vincoli da query:
+    - coverage (m²): '600 m²', '600 mq', '>= 800 m²', 'almeno 800 mq'
+    - noise (dB): '< 60 dB', 'sotto 60 dB', '<=58 db', 'massimo 59 dB'
+    - slope (%): 'pendenza 35%', '>=35%', 'almeno 35%', 'slope 35%'
+    Ritorna dict con chiavi *_min / *_max.
+    """
+    t = normalize(q).replace(",", ".")
+    c = {}
+
+    # coverage m2
+    # pattern numero + m2/mq/m² con eventuale operatore
+    cov_op_num = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*(m2|mq|m²)", t)
+    if cov_op_num:
+        op, num = cov_op_num.group(1), float(cov_op_num.group(2))
+        if op in (">", ">=") or re.search(r"\b(almeno|minimo|min)\b", t):
+            c["coverage_m2_min"] = num
+        elif op in ("<", "<=") or re.search(r"\b(sotto|massimo|max)\b", t):
+            c["coverage_m2_max"] = num
+        else:
+            # se nessun operatore, trattiamo come target minimo (copertura richiesta)
+            c["coverage_m2_min"] = num
+
+    # noise dB
+    noise_phrase = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*d\s*b", t)
+    if noise_phrase or re.search(r"(sotto|max|massimo|minimo|almeno)\s*\d+(?:\.\d+)?\s*d\s*b", t):
+        if noise_phrase:
+            op, num = noise_phrase.group(1), float(noise_phrase.group(2))
+        else:
+            m = re.search(r"(sotto|max|massimo|minimo|almeno)\s*(\d+(?:\.\d+)?)\s*d\s*b", t)
+            word, num = m.group(1), float(m.group(2))
+            op = "<=" if word in ("sotto", "max", "massimo") else ">="
+
+        if op in ("<", "<="):
+            c["noise_db_max"] = num
+        elif op in (">", ">="):
+            c["noise_db_min"] = num
+        else:
+            c["noise_db_max"] = num
+
+    # slope %
+    slope_any = re.search(r"(<=|>=|<|>)?\s*(\d+(?:\.\d+)?)\s*%(\s*(pendenza|slope))?", t)
+    if slope_any or re.search(r"(pendenza|slope)\s*(\d+(?:\.\d+)?)\s*%", t):
+        if slope_any:
+            op, num = slope_any.group(1), float(slope_any.group(2))
+        else:
+            m = re.search(r"(pendenza|slope)\s*(\d+(?:\.\d+)?)\s*%", t)
+            op, num = None, float(m.group(2))
+        # interpretazione: l’utente indica una pendenza che il modello deve poter gestire (min capability)
+        if (op in (">", ">=")) or re.search(r"\b(almeno|minimo|min)\b", t):
+            c["slope_max_percent_min"] = num
+        elif op in ("<", "<=") or re.search(r"\b(sotto|max|massimo)\b", t):
+            c["slope_max_percent_max"] = num
+        else:
+            c["slope_max_percent_min"] = num
+
+    return c
+
+# -------------------- Utilities --------------------
 def build_passage(row: pd.Series) -> str:
     parts = [
         f"Title: {row.get('title','')}",
@@ -31,27 +93,14 @@ def build_passage(row: pd.Series) -> str:
     ]
     return "\n".join([p for p in parts if p and str(p).strip()])
 
-def extract_numbers(text: str) -> Dict[str, float]:
-    """Heuristics: estrai m², dB, pendenza % se presenti nella query per un ranking più intelligente."""
-    t = text.lower().replace(",", ".")
-    res = {}
-    m2 = re.search(r"(\d+(?:\.\d+)?)\s*(m2|mq|m²)", t)
-    if m2: res["coverage_m2"] = float(m2.group(1))
-    db = re.search(r"(\d+(?:\.\d+)?)\s*dB", t)
-    if db: res["noise_db"] = float(db.group(1))
-    slope = re.search(r"(\d+(?:\.\d+)?)\s*%(\s*di)?\s*(pendenza|slope)?", t)
-    if slope: res["slope_max_percent"] = float(slope.group(1))
-    return res
-
 @st.cache_resource(show_spinner=True)
 def load_data_and_index() -> Tuple[pd.DataFrame, List[str], List[Dict[str,Any]], Any, Any]:
     if not DATA_PATH.exists():
         st.error("Manca data/pdp_sample.csv. Caricalo nel repo.")
         st.stop()
     df = pd.read_csv(DATA_PATH)
-    # Passaggi testuali + meta
-    passages = []
-    meta = []
+    # Passaggi & meta
+    passages, meta = [], []
     for _, r in df.iterrows():
         passages.append(build_passage(r))
         meta.append({
@@ -66,14 +115,13 @@ def load_data_and_index() -> Tuple[pd.DataFrame, List[str], List[Dict[str,Any]],
             "slope_max_percent": r.get("slope_max_percent", np.nan),
             "price_eur": r.get("price_eur", np.nan),
         })
-    # Embeddings + index NN (cosine)
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     emb = model.encode(passages, normalize_embeddings=True)
-    nn = NearestNeighbors(n_neighbors=8, metric="cosine")
+    nn = NearestNeighbors(n_neighbors=12, metric="cosine")
     nn.fit(emb)
     return df, passages, meta, model, nn
 
-def retrieve(query: str, model, nn, passages, meta, top_k=6):
+def retrieve(query: str, model, nn, passages, meta, top_k=10):
     q_emb = model.encode([query], normalize_embeddings=True)
     dist, idx = nn.kneighbors(q_emb, n_neighbors=top_k)
     hits = []
@@ -81,43 +129,76 @@ def retrieve(query: str, model, nn, passages, meta, top_k=6):
         hits.append({"score": float(1 - d), "passage": passages[i], "meta": meta[i]})
     return hits
 
-def score_fit(h: Dict[str,Any], wish: Dict[str,float]) -> float:
-    """Rerank semplice usando vincoli utente (m2, dB, pendenza)."""
+# -------------------- Hard filter + ranking --------------------
+def hard_filter(hits: List[Dict[str,Any]], cons: Dict[str,Any]) -> List[Dict[str,Any]]:
+    def ok(m: Dict[str,Any]) -> bool:
+        # coverage
+        if "coverage_m2_min" in cons and pd.notna(m.get("coverage_m2")):
+            if float(m["coverage_m2"]) < cons["coverage_m2_min"]:
+                return False
+        if "coverage_m2_max" in cons and pd.notna(m.get("coverage_m2")):
+            if float(m["coverage_m2"]) > cons["coverage_m2_max"]:
+                return False
+        # noise
+        if "noise_db_max" in cons and pd.notna(m.get("noise_db")):
+            if float(m["noise_db"]) > cons["noise_db_max"]:
+                return False
+        if "noise_db_min" in cons and pd.notna(m.get("noise_db")):
+            if float(m["noise_db"]) < cons["noise_db_min"]:
+                return False
+        # slope
+        if "slope_max_percent_min" in cons and pd.notna(m.get("slope_max_percent")):
+            if float(m["slope_max_percent"]) < cons["slope_max_percent_min"]:
+                return False
+        if "slope_max_percent_max" in cons and pd.notna(m.get("slope_max_percent")):
+            if float(m["slope_max_percent"]) > cons["slope_max_percent_max"]:
+                return False
+        return True
+
+    return [h for h in hits if ok(h["meta"])]
+
+def score_fit(h: Dict[str,Any], cons: Dict[str,Any]) -> float:
     fit = 0.0
     m = h["meta"]
-    # Copertura: preferisci coverage >= richiesta (entro +50%)
-    if "coverage_m2" in wish and pd.notna(m.get("coverage_m2")):
-        w = wish["coverage_m2"]; c = float(m["coverage_m2"])
-        if c >= w: 
-            # più vicino è al target, meglio è
-            fit += 1.0 - min((c - w)/max(w,1), 0.5)
-    # Rumore: preferisci <= soglia
-    if "noise_db" in wish and pd.notna(m.get("noise_db")):
-        w = wish["noise_db"]; n = float(m["noise_db"])
-        if n <= w:
-            fit += 1.0 - min((w - n)/max(w,1), 0.5)
-    # Pendenza: preferisci slope_max >= richiesta
-    if "slope_max_percent" in wish and pd.notna(m.get("slope_max_percent")):
-        w = wish["slope_max_percent"]; s = float(m["slope_max_percent"])
-        if s >= w:
-            fit += 1.0 - min((s - w)/max(w,1), 0.5)
+    # preferenza soft per avvicinamento ai vincoli
+    if "coverage_m2_min" in cons and pd.notna(m.get("coverage_m2")):
+        w = cons["coverage_m2_min"]; c = float(m["coverage_m2"])
+        if c >= w: fit += 1.0 - min((c - w)/max(w,1), 0.5)
+    if "noise_db_max" in cons and pd.notna(m.get("noise_db")):
+        w = cons["noise_db_max"]; n = float(m["noise_db"])
+        if n <= w: fit += 1.0 - min((w - n)/max(w,1), 0.5)
+    if "slope_max_percent_min" in cons and pd.notna(m.get("slope_max_percent")):
+        w = cons["slope_max_percent_min"]; s = float(m["slope_max_percent"])
+        if s >= w: fit += 1.0 - min((s - w)/max(w,1), 0.5)
     return fit
 
-def compose_answer(query: str, hits: List[Dict[str,Any]], wish: Dict[str,float]) -> str:
+def compose_answer(query: str, hits: List[Dict[str,Any]], cons: Dict[str,Any], filtered_out: bool) -> str:
     if not hits:
-        return "Non trovo info sufficienti. Puoi indicare area (m²), pendenza (%) o target di rumorosità (dB)?"
-    # Rerank by semantic score + wish fit
+        msg = "Nessun modello rispetta i vincoli richiesti."
+        tips = []
+        if "noise_db_max" in cons: tips.append(f"rumorosità ≤ {cons['noise_db_max']} dB")
+        if "coverage_m2_min" in cons: tips.append(f"copertura ≥ {cons['coverage_m2_min']} m²")
+        if "slope_max_percent_min" in cons: tips.append(f"pendenza ≥ {cons['slope_max_percent_min']}%")
+        if tips: msg += " (vincoli: " + ", ".join(tips) + ")"
+        msg += "\nVuoi che ti mostri le **migliori alternative più vicine** ai requisiti?"
+        return msg
+
+    # rerank (score semantico + fit)
     for h in hits:
-        h["fit"] = score_fit(h, wish)
+        h["fit"] = score_fit(h, cons)
         h["tot"] = 0.7*h["score"] + 0.3*h["fit"]
     hits = sorted(hits, key=lambda x: x["tot"], reverse=True)
 
     lines = [f"**Domanda:** {query}"]
+    if filtered_out:
+        lines.append("> Ho applicato filtri rigidi in base ai vincoli della domanda (es. dB, m², pendenza).")
+
     lines.append("**Opzioni consigliate (ordinate per pertinenza):**")
     for h in hits:
         m = h["meta"]
         lines.append(
-            f"- **{m['title']}** — copertura **{m.get('coverage_m2','?')} m²**, pendenza max **{m.get('slope_max_percent','?')}%**, "
+            f"- **{m['title']}** — copertura **{m.get('coverage_m2','?')} m²**, "
+            f"pendenza max **{m.get('slope_max_percent','?')}%**, "
             f"rumorosità **{m.get('noise_db','?')} dB** — [PDP]({m['pdp_url']})"
         )
     cites = " | ".join(sorted({h['meta']['pdp_url'] for h in hits if h['meta']['pdp_url']}))
@@ -125,10 +206,10 @@ def compose_answer(query: str, hits: List[Dict[str,Any]], wish: Dict[str,float])
     lines.append("\nVuoi **confrontare** due modelli, verificare **compatibilità batteria**, o preferisci quello **più silenzioso**?")
     return "\n".join(lines)
 
-# ---------- App ----------
+# -------------------- App --------------------
 with st.sidebar:
-    st.subheader("Filtri/indicazioni (estratti automaticamente dalla domanda)")
-    st.write("Inserisci nella domanda indicazioni tipo: `600 m²`, `<60 dB`, `pendenza 35%`.")
+    st.subheader("Suggerimenti")
+    st.write("Indica nella domanda vincoli chiari: `600 m²`, `pendenza ≥ 35%`, `sotto 60 dB`.")
     st.divider()
     st.write("Esempi:")
     st.code("robot per 600 m², pendenza 35%, sotto 60 dB")
@@ -139,12 +220,24 @@ df, passages, meta, model, nn = load_data_and_index()
 
 query = st.text_input("Fai una domanda sulle PDP STIGA (IT/EN):", "")
 if query:
-    wish = extract_numbers(query)
-    with st.spinner("Cerco tra le PDP…"):
-        hits = retrieve(query, model, nn, passages, meta)
-        answer = compose_answer(query, hits, wish)
+    cons = parse_constraints(query)
+    hits = retrieve(query, model, nn, passages, meta)
+
+    # hard filter prima del rerank
+    filtered = hard_filter(hits, cons)
+    filtered_out = False
+    if filtered:
+        filtered_out = True
+        used = filtered
+    else:
+        used = hits  # fallback se nessuno matcha i vincoli
+
+    answer = compose_answer(query, used, cons, filtered_out)
     st.markdown(answer)
+
     with st.expander("🔎 Passaggi usati (debug)"):
-        for h in hits:
-            st.write(h["meta"]["title"], "—", h["meta"]["pdp_url"], f"(score={h['score']:.3f}, fit={h['fit']:.3f})")
+        st.write("Vincoli estratti:", cons)
+        st.write("Candidati (score, fit, tot):")
+        for h in used:
+            st.write(h["meta"]["title"], "—", h["meta"]["pdp_url"], f"(score={h.get('score',0):.3f}, fit={h.get('fit',0):.3f}, tot={h.get('tot',0):.3f})")
             st.code(h["passage"])
