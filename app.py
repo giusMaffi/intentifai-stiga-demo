@@ -3,6 +3,12 @@ import json
 import pandas as pd
 import numpy as np
 import streamlit as st
+import requests
+
+SAFE_BASE = "https://www.stiga.com"
+SAFE_LOCALE = "/it"  # puoi cambiare in "/en", "/fr", ecc.
+SEARCH_URL = f"{SAFE_BASE}{SAFE_LOCALE}/search/?q="
+
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from sentence_transformers import SentenceTransformer
@@ -275,6 +281,27 @@ def score_fit_cat(m: Dict[str,Any], cons: Dict[str,Dict[str,float]], weights: Di
             if float(val) >= rng["min"]:
                 fit += w * (1.0 - min((float(val) - rng["min"]) / max(rng["min"], 1), 0.5))
     return fit
+@st.cache_data(show_spinner=False, ttl=3600)
+def url_is_ok(url: str) -> bool:
+    if not url or not url.startswith("http"):
+        return False
+    try:
+        # alcuni siti non rispondono a HEAD, usiamo GET leggero
+        r = requests.get(url, timeout=3, allow_redirects=True, stream=True)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+def build_search_fallback(m: Dict[str, any]) -> str:
+    q = m.get("sku") or m.get("title") or ""
+    q = requests.utils.quote(str(q))
+    return f"{SEARCH_URL}{q}"
+
+def safe_pdp_url(m: Dict[str, any]) -> str:
+    url = m.get("pdp_url") or ""
+    if url_is_ok(url):
+        return url
+    return ""  # segnala che non è disponibile
 
 def render_results(title: str, order_idx: List[int], meta: List[Dict[str,Any]], cfg: Dict[str,Any], limit: int = 50):
     if not order_idx:
@@ -286,16 +313,27 @@ def render_results(title: str, order_idx: List[int], meta: List[Dict[str,Any]], 
     key_fields = cfg.get("result_fields", [])
     for i in order_idx:
         m = meta[i]
-        cites.add(m["pdp_url"])
+        cites.add(m.get("pdp_url",""))
         bits = []
         if "coverage_m2" in key_fields: bits.append(f"copertura **{m.get('coverage_m2','?')} m²**")
         if "slope_max_percent" in key_fields: bits.append(f"pendenza max **{m.get('slope_max_percent','?')}%**")
         if "noise_db" in key_fields: bits.append(f"rumorosità **{m.get('noise_db','?')} dB**")
-        st.markdown(f"- **{m['title']}** — " + " · ".join(bits) + f" — [PDP]({m['pdp_url']})")
+
+        pdp = safe_pdp_url(m)
+        if pdp:
+            link_part = f"[PDP]({pdp}) · [Cerca su STIGA]({build_search_fallback(m)})"
+        else:
+            link_part = f"[Cerca su STIGA]({build_search_fallback(m)})"
+
+        st.markdown(f"- **{m['title']}** — " + " · ".join(bits) + " — " + link_part)
+
         shown += 1
         if shown >= limit:
             break
-    st.markdown("**Fonti PDP:** " + " | ".join(sorted(cites)))
+
+    cites = {c for c in cites if c}
+    if cites:
+        st.markdown("**Fonti PDP (fornite):** " + " | ".join(sorted(cites)))
 
 # ============ App ============
 
